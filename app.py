@@ -2,10 +2,12 @@ import os
 import re
 import streamlit as st
 
-# --- MUST be the first Streamlit call ---
-st.set_page_config(page_title="QA Assistant (Cloud RAG)", page_icon="🧪", layout="wide")
+# ------------- Setup (must be first Streamlit call) -------------
+st.set_page_config(page_title="QA Assistant (Safe Demo)", page_icon="🧪", layout="wide")
+st.title("🧪 QA Assistant — Safe Demo")
+st.caption("Upload/paste a small excerpt, then ask a question. No reruns, no hidden crashes.")
 
-# ===== Helpers =====
+# ------------- Helpers -------------
 _TOKENIZER = re.compile(r"[A-Za-z0-9_]+")
 
 def tok(s: str): 
@@ -44,7 +46,6 @@ def format_ctx(snips):
     return "\n\n---\n\n".join(parts), " | ".join(cites)
 
 def _safe_decode_bytes(raw: bytes) -> str:
-    # robust decode; never throws
     try:
         return raw.decode("utf-8", errors="replace")
     except Exception:
@@ -53,8 +54,7 @@ def _safe_decode_bytes(raw: bytes) -> str:
         except Exception:
             return raw.decode(errors="replace")
 
-def _get_api_key() -> str:
-    # Prefer Streamlit secrets; fall back to env var
+def get_api_key() -> str:
     key = ""
     try:
         key = st.secrets.get("OPENAI_API_KEY", "").strip()
@@ -64,18 +64,6 @@ def _get_api_key() -> str:
         key = os.environ.get("OPENAI_API_KEY", "").strip()
     return key
 
-def call_openai(client, model: str, prompt: str, temperature: float = 0.2) -> str:
-    # Import here to avoid import-time crashes if openai lib changes
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return f"⚠️ Error calling model: {e}"
-
 SYSTEM_PROMPT = """You are a helpful QA lead/test automation copilot.
 - Be concise and specific.
 - Prefer practical checklists, code snippets, and risk-based testing advice.
@@ -83,142 +71,107 @@ SYSTEM_PROMPT = """You are a helpful QA lead/test automation copilot.
 - If the provided context is insufficient, say you don't know.
 """
 
-# ===== Sidebar: Diagnostics & Controls =====
-st.sidebar.title("Diagnostics")
+# ------------- State -------------
+if "corpus" not in st.session_state:
+    st.session_state["corpus"] = []
+if "doc_name" not in st.session_state:
+    st.session_state["doc_name"] = None
 
-# Key + client init (safe)
-API_KEY = _get_api_key()
-if API_KEY:
-    st.sidebar.success(f"OPENAI_API_KEY found ({len(API_KEY)} chars)")
-else:
-    st.sidebar.error(
-        "OPENAI_API_KEY missing.\n\n"
-        "Add it in Streamlit Cloud → ⋯ → **Settings** → **Secrets** → Edit secrets:\n"
-        'OPENAI_API_KEY = "sk-..."\n\n'
-        "Or set it under **Python environment variables** with the same name."
-    )
+# ------------- Diagnostics (always visible) -------------
+with st.sidebar:
+    st.subheader("Diagnostics")
+    API_KEY = get_api_key()
+    if API_KEY:
+        st.success(f"OPENAI_API_KEY found ({len(API_KEY)} chars)")
+    else:
+        st.warning("OPENAI_API_KEY missing (you can still load a doc; you'll need it to ask).")
+    st.info(f"Chunks loaded: {len(st.session_state['corpus'])}")
 
-# Optional quick test call
-with st.sidebar.expander("Test OpenAI", expanded=False):
-    model_test = st.text_input("Model to test", value="gpt-4o-mini")
-    if st.button("Run test"):
-        if not API_KEY:
-            st.warning("No API key. Add it in Secrets first.")
-        else:
-            try:
-                from openai import OpenAI
-                client_test = OpenAI(api_key=API_KEY)
-                msg = call_openai(client_test, model_test, "Say 'ready'", temperature=0)
-                st.write(msg)
-            except Exception as e:
-                st.exception(e)
+# ------------- Uploader (bullet-proof) -------------
+st.markdown("### 1) Load ONE doc excerpt")
+MAX_BYTES = 200_000  # ~200 KB cap
 
-# Small debug panel
-with st.sidebar.expander("RAG status", expanded=True):
-    if "corpus" not in st.session_state:
-        st.session_state["corpus"] = []
-    st.write(f"Chunks loaded: **{len(st.session_state['corpus'])}**")
-    DEBUG = st.checkbox("Enable verbose debug", value=False)
+up = st.file_uploader("Upload .txt/.md (<= 200 KB)", type=["txt", "md"])
+pasted = st.text_area("Or paste text", height=160, placeholder="Paste a few paragraphs…")
 
-# ===== Main UI =====
-st.title("🧪 QA Assistant — Streamlit (Cloud + tiny RAG)")
-st.caption("Upload or paste a small doc excerpt. Answers show sources. Powered by OpenAI.")
-
-# Model & temperature (main controls)
-colA, colB = st.columns([2, 1])
-with colA:
-    model = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
-with colB:
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
-
-st.markdown("### Load ONE doc (excerpt)")
-MAX_BYTES = 200_000  # ~200 KB cap to keep things snappy
-
-up = st.file_uploader("Upload .txt / .md (<= 200 KB)", type=["txt", "md"])
-pasted = st.text_area("Or paste text", height=180, placeholder="Paste a non-sensitive excerpt (a few paragraphs)…")
-load_col1, load_col2 = st.columns([1, 1])
-with load_col1:
-    if st.button("Load doc"):
+col_load1, col_load2 = st.columns([1, 1])
+with col_load1:
+    if st.button("Load doc", type="primary"):
         try:
             if (up is None) and (not pasted.strip()):
-                st.warning("Upload a file or paste text first.")
+                st.error("Upload a file or paste text first.")
             else:
                 if up is not None:
-                    # size guard + robust decode
                     up.seek(0, os.SEEK_END); size = up.tell(); up.seek(0)
                     if size > MAX_BYTES:
-                        st.error(f"File too large for demo (>{MAX_BYTES} bytes). Upload a smaller excerpt.")
+                        st.error(f"File too large (>{MAX_BYTES} bytes). Upload a smaller excerpt.")
                     else:
                         raw = up.read()
                         txt = _safe_decode_bytes(raw)
                         name = up.name or "uploaded.txt"
-                        txt = txt.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
-                        if not txt.strip():
-                            st.error("The document appears empty after decoding.")
-                        else:
-                            st.session_state["corpus"] = make_corpus(name, txt)
-                            st.success(f"Loaded {len(st.session_state['corpus'])} chunks from {name}")
-                            if DEBUG: st.info(f"First 200 chars:\n\n{txt[:200]!r}")
                 else:
                     raw = pasted.encode("utf-8", errors="ignore")
                     if len(raw) > MAX_BYTES:
                         st.error(f"Pasted text too large (>{MAX_BYTES} bytes). Paste a smaller excerpt.")
+                        txt, name = "", ""
                     else:
-                        txt = pasted.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
-                        st.session_state["corpus"] = make_corpus("pasted.txt", txt)
-                        st.success(f"Loaded {len(st.session_state['corpus'])} chunks from pasted text")
-                        if DEBUG: st.info(f"First 200 chars:\n\n{txt[:200]!r}")
+                        txt = pasted; name = "pasted.txt"
+
+                txt = txt.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+                if txt.strip():
+                    st.session_state["corpus"] = make_corpus(name, txt)
+                    st.session_state["doc_name"] = name
+                    st.success(f"Loaded {len(st.session_state['corpus'])} chunks from {name}")
+                    st.code(txt[:300] + ("..." if len(txt) > 300 else ""), language="markdown")
+                else:
+                    st.error("The document appears empty after decoding.")
         except Exception as e:
             st.exception(e)
 
-with load_col2:
-    if st.button("Clear data & chat"):
-        st.session_state.clear()
-        st.rerun()
+with col_load2:
+    if st.button("Clear data"):
+        st.session_state["corpus"] = []
+        st.session_state["doc_name"] = None
+        st.success("Cleared document from memory.")
 
-# Chat history
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
+# ------------- Ask (no reruns, no magic) -------------
+st.markdown("### 2) Ask a QA question")
+q = st.text_input("Your question")
+ask_col1, ask_col2 = st.columns([1, 3])
+with ask_col1:
+    ask_clicked = st.button("Ask", type="secondary")
 
-for m in st.session_state["messages"]:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# Chat input
-q = st.chat_input("Ask a QA question…")
-if q:
-    st.session_state["messages"].append({"role": "user", "content": q})
-    with st.chat_message("user"):
-        st.markdown(q)
-
-    # Build context from the loaded corpus
-    ctx_block, src_line = format_ctx(retrieve(st.session_state["corpus"], q, k=4))
-
-    # Compose prompt
-    transcript = "\n".join(
-        f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
-        for m in st.session_state["messages"][-8:]
-    )
-    prompt = (
-        f"System:\n{SYSTEM_PROMPT}\n\n"
-        + (f"Context (use ONLY this to answer; if insufficient, say you don't know):\n{ctx_block}\n\n" if ctx_block else "")
-        + f"{transcript}\nAssistant:"
-    )
-
-    # Call OpenAI (only if API key is present)
-    answer = "⚠️ No API key configured."
-    if API_KEY:
+if ask_clicked:
+    if not q.strip():
+        st.error("Type a question first.")
+    elif not st.session_state["corpus"]:
+        st.error("Load a document excerpt in step 1 first.")
+    elif not API_KEY:
+        st.error("No OPENAI_API_KEY configured. Add it in Streamlit Cloud → Settings → Secrets.")
+    else:
         try:
             from openai import OpenAI
             client = OpenAI(api_key=API_KEY)
-            answer = call_openai(client, model, prompt, temperature=temperature)
+
+            ctx_block, src_line = format_ctx(retrieve(st.session_state["corpus"], q, k=4))
+            transcript = f"User: {q}\nAssistant:"
+            prompt = (
+                f"System:\n{SYSTEM_PROMPT}\n\n"
+                + (f"Context (use ONLY this to answer; if insufficient, say you don't know):\n{ctx_block}\n\n" if ctx_block else "")
+                + transcript
+            )
+
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ans = resp.choices[0].message.content
+
+            if src_line:
+                ans += f"\n\n---\n**Sources:** {src_line}"
+
+            st.markdown("#### Answer")
+            st.markdown(ans)
         except Exception as e:
-            answer = f"⚠️ Failed to init/call OpenAI: {e}"
-
-    if src_line:
-        answer += f"\n\n---\n**Sources:** {src_line}"
-
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-    st.session_state["messages"].append({"role": "assistant", "content": answer})
-    st.experimental_rerun()
+            st.exception(e)
