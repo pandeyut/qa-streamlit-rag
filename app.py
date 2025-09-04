@@ -8,6 +8,24 @@ SYSTEM_PROMPT = """You are a helpful QA lead/test automation copilot.
 - If the provided context is insufficient, say you don't know.
 """
 
+# --- MUST be first Streamlit call ---
+st.set_page_config(page_title="QA Assistant (Cloud RAG)", page_icon="🧪", layout="wide")
+
+# Fail fast with a friendly message instead of crashing
+if "OPENAI_API_KEY" not in st.secrets or not st.secrets["OPENAI_API_KEY"].strip():
+    st.error(
+        "OPENAI_API_KEY not set. In Streamlit Cloud: Menu ⋯ → Settings → Secrets → "
+        'add:\n\nOPENAI_API_KEY = "sk-..."'
+    )
+    st.stop()
+
+# Safe client init (render error instead of crashing)
+try:
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+except Exception as e:
+    st.error(f"Failed to init OpenAI client: {e}")
+    st.stop()
+
 # ---- tiny RAG helpers ----
 _TOKENIZER = re.compile(r"[A-Za-z0-9_]+")
 def tok(s): return [t.lower() for t in _TOKENIZER.findall(s or "")]
@@ -38,7 +56,6 @@ def format_ctx(snips):
     return "\n\n---\n\n".join(parts), " | ".join(cites)
 
 # ---- UI ----
-st.set_page_config(page_title="QA Assistant (Cloud RAG)", page_icon="🧪", layout="wide")
 st.title("🧪 QA Assistant — Streamlit (Cloud + tiny RAG)")
 st.caption("Upload or paste one doc. Answers show sources. Powered by OpenAI.")
 
@@ -91,7 +108,6 @@ if q:
 
     with st.chat_message("assistant"):
         try:
-            client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
             resp = client.chat.completions.create(
                 model=model,
                 temperature=temperature,
